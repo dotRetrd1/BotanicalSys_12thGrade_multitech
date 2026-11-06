@@ -15,6 +15,8 @@ constexpr uint32_t PH_INTERVAL_MS = 15UL * 60UL * 1000UL;
 constexpr uint32_t TEMPERATURE_INTERVAL_MS = 30UL * 1000UL;
 constexpr uint32_t EC_INTERVAL_MS = 5UL * 60UL * 1000UL;
 constexpr uint32_t WATER_LEVEL_INTERVAL_MS = 1000UL;
+constexpr uint32_t MIN_INTERVAL_SECONDS[] = {60, 1, 10, 1};
+constexpr uint32_t MAX_INTERVAL_SECONDS[] = {86400, 86400, 86400, 3600};
 constexpr size_t COMMAND_BUFFER_SIZE = 48;
 
 using ProbeReader = float (*)();
@@ -53,6 +55,7 @@ float readTemperatureProbe();
 float readEcProbe();
 float readWaterLevelProbe();
 bool parseFloatValue(const char* text, float& value);
+bool parseIntervalSeconds(const char* text, uint32_t& seconds);
 void handleCommand(char* commandLine);
 void updateSensor(SensorState& sensor, uint32_t now);
 void evaluateControlStatus(SensorState& sensor);
@@ -113,6 +116,27 @@ bool parseFloatValue(const char* text, float& value) {
   return true;
 }
 
+bool parseIntervalSeconds(const char* text, uint32_t& seconds) {
+  if (*text == '-') {
+    return false;
+  }
+
+  char* end = nullptr;
+  unsigned long parsedSeconds = strtoul(text, &end, 10);
+  if (end == text) {
+    return false;
+  }
+  while (*end == ' ' || *end == '\t') {
+    ++end;
+  }
+  if (*end != '\0' || parsedSeconds == 0 || parsedSeconds > UINT32_MAX / 1000UL) {
+    return false;
+  }
+
+  seconds = static_cast<uint32_t>(parsedSeconds);
+  return true;
+}
+
 void communicate() {
   while (SerialBT.available()) {
     char character = static_cast<char>(SerialBT.read());
@@ -166,6 +190,12 @@ void handleCommand(char* commandLine) {
     return;
   }
 
+  if (command >= 210 && command <= 213) {
+    SerialBT.print(sensors[command - 210].intervalMs / 1000UL);
+    SerialBT.println(" seconds");
+    return;
+  }
+
   if (command == 500) {
     for (size_t index = 0; index < sizeof(sensors) / sizeof(sensors[0]); ++index) {
       if (index > 0) SerialBT.print(" | ");
@@ -174,8 +204,30 @@ void handleCommand(char* commandLine) {
       printSensorValue(sensors[index], SerialBT);
       SerialBT.print(" | target: ");
       SerialBT.print(sensors[index].target, 2);
+      SerialBT.print(" | interval: ");
+      SerialBT.print(sensors[index].intervalMs / 1000UL);
+      SerialBT.print("s");
     }
     SerialBT.println();
+    return;
+  }
+
+  if (command >= 301 && command <= 304) {
+    size_t index = static_cast<size_t>(command - 301);
+    uint32_t intervalSeconds = 0;
+    if (valueText == nullptr || !parseIntervalSeconds(valueText, intervalSeconds) ||
+        intervalSeconds < MIN_INTERVAL_SECONDS[index] ||
+        intervalSeconds > MAX_INTERVAL_SECONDS[index]) {
+      SerialBT.println("Invalid interval in seconds");
+      return;
+    }
+
+    sensors[index].intervalMs = intervalSeconds * 1000UL;
+    sensors[index].lastReadAt = millis();
+    sensors[index].hasRead = true;
+    SerialBT.print("Interval updated to ");
+    SerialBT.print(intervalSeconds);
+    SerialBT.println(" seconds");
     return;
   }
 
@@ -266,7 +318,11 @@ void printSensorValue(const SensorState& sensor, Print& output) {
 
 float readPhProbe() {
   float rawValue = analogRead(phPin);
+  Serial.print("Raw pH value: ");
+  Serial.println(rawValue);
   float pHValue = map(rawValue, 0, 4095, 0, 14);
+  Serial.print("Mapped pH value: ");
+  Serial.println(pHValue);
   return pHValue;
 }
 
@@ -289,4 +345,5 @@ float readWaterLevelProbe() {
   return waterLevelReached ? 1.0f : 0.0f;
 }
 
-// Queries: 200-203, 500 (all). Set targets with 101-104:value, e.g. 101:7.2.
+// Queries: 200-203 (readings), 210-213 (intervals), 500 (all).
+// Set targets with 101-104:value and intervals in seconds with 301-304:value.
