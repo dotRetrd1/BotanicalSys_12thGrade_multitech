@@ -1,31 +1,73 @@
 #include <Arduino.h>
+#include <WiFi.h>
 
-#define phPin 32
-#define ecPin 33
 
-int pins2Print[] = {phPin,ecPin};
+WiFiServer wifiServer(5000);
 
-void readAndPrint();
+#define tempPin 32
+#define phPin 33
+
+int readAndPrint(int pin, bool print);
+float calculatePh(int raw);
+void communicate();
 
 void setup() {
   Serial.begin(115200);
-  pinMode(phPin,INPUT);
-  pinMode(ecPin,INPUT);
+  delay(1000);
+
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid,password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  Serial.println("\nWiFi Connected");
+  Serial.print("Ip: ");
+  Serial.print(WiFi.localIP());
+
+  wifiServer.begin();
+
+  pinMode(phPin, INPUT);
+  pinMode(tempPin, INPUT);
 }
 
 void loop() {
-  //readAndPrint();
+  int rawPh = readAndPrint(phPin, false);
+  float phValue = calculatePh(rawPh);
+  
+  Serial.print("Calculated pH: ");
+  Serial.println(phValue);
+
+  communicate();
+
 }
 
-void readAndPrint() {
-  int len = sizeof(pins2Print);
-  float reads[len] = {};
-  for(int i=0; i<len; i++) {
-    reads[i] = analogRead(pins2Print[i]);
-    Serial.print("Pin ");
-    Serial.print(pins2Print[i]);
-    Serial.print(": ");
-    Serial.print(reads[i]);
+void communicate() {
+  WiFiClient client = wifiServer.available();
+  if (client) {
+    // wifi to serial
+    while (client.available() > 0)
+    {
+      char c = Serial.read();
+      client.write(c);
+    }
   }
-  Serial.print("\n");
+  client.stop();
+}
+
+int readAndPrint(int pin,bool print) {
+  int value = analogRead(pin); 
+  if (print) {
+    Serial.print("Pin ");
+    Serial.print(pin);
+    Serial.print(": ");
+    Serial.print(value);
+    Serial.print(" | ");
+  }
+  return value;
+}
+
+float calculatePh(int raw) {
+  return (float)raw * (14.0 / 4095.0);
 }
