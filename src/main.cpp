@@ -2,53 +2,110 @@
 #include <BluetoothSerial.h>
 #include <math.h>
 #include <stdlib.h>
+#include <string.h>
 
 BluetoothSerial SerialBT;
 
 constexpr int tempPin = 32;
 constexpr int phPin = 33;
+constexpr int ecPin = 34;
+constexpr int waterLevelPin = 35;
 
-float expectedPh = 7.0f;
-float expectedTemp = 0.0f;
-float expectedEc = 0.0f;
-float expectedWaterLevel = 0.0f;
+constexpr uint32_t PH_INTERVAL_MS = 15UL * 60UL * 1000UL;
+constexpr uint32_t TEMPERATURE_INTERVAL_MS = 30UL * 1000UL;
+constexpr uint32_t EC_INTERVAL_MS = 5UL * 60UL * 1000UL;
+constexpr uint32_t WATER_LEVEL_INTERVAL_MS = 1000UL;
+constexpr size_t COMMAND_BUFFER_SIZE = 48;
 
-float currentPh = 0.0f;
+using ProbeReader = float (*)();
 
-int readAndPrint(int pin, bool printValue);
-float calculatePh(int raw);
-bool parseFloatValue(String text, float& value);
-void updateWantedValue(int command, float value);
+struct SensorState {
+  const char* name;
+  uint32_t intervalMs;
+  ProbeReader readProbe;
+  float target;
+  float minimumTarget;
+  float maximumTarget;
+  float tolerance;
+  float reportThreshold;
+  float value;
+  float lastPrintedValue;
+  uint32_t lastReadAt;
+  int previousStatus;
+  bool hasRead;
+  bool available;
+  bool hasPrintedValue;
+  bool unavailableReported;
+
+  // constructor to initialize default values
+  SensorState(const char* sensorName, uint32_t interval, ProbeReader reader,
+              float initialTarget, float minimum, float maximum,
+              float allowedError, float printThreshold)
+      : name(sensorName), intervalMs(interval), readProbe(reader),
+        target(initialTarget), minimumTarget(minimum), maximumTarget(maximum),
+        tolerance(allowedError), reportThreshold(printThreshold), value(NAN),
+        lastPrintedValue(NAN), lastReadAt(0), previousStatus(2), hasRead(false),
+        available(false), hasPrintedValue(false), unavailableReported(false) {}
+};
+
+float readPhProbe();
+float readTemperatureProbe();
+float readEcProbe();
+float readWaterLevelProbe();
+bool parseFloatValue(const char* text, float& value);
+void handleCommand(char* commandLine);
+void updateSensor(SensorState& sensor, uint32_t now);
+void evaluateControlStatus(SensorState& sensor);
+void printSensorValue(const SensorState& sensor, Print& output);
 void communicate();
-void closeLoop(float expected, float actual, float tolerance);
+
+SensorState sensors[] = { // Name, Interval, Reader, Target, Min, Max, Tolerance, ReportThreshold
+  {"pH", PH_INTERVAL_MS, readPhProbe, 7.6f, 0.0f, 14.0f, 0.5f, 0.01f},
+  {"Temperature", TEMPERATURE_INTERVAL_MS, readTemperatureProbe, 25.0f, 0.0f, 100.0f, 5.0f, 0.1f},
+  {"EC", EC_INTERVAL_MS, readEcProbe, 75.0f, 0.0f, 1000.0f, 0.5f, 1.0f},
+  {"Water level", WATER_LEVEL_INTERVAL_MS, readWaterLevelProbe, 0.0f, 0.0f, 1.0f, 0.5f, 0.5f}
+};
+
+char commandBuffer[COMMAND_BUFFER_SIZE];
+size_t commandLength = 0;
+bool discardCommand = false;
 
 void setup() {
   Serial.begin(115200);
   SerialBT.begin("Ido");
-  SerialBT.setTimeout(50);
   analogReadResolution(12);
 
   pinMode(phPin, INPUT);
   pinMode(tempPin, INPUT);
+  pinMode(ecPin, INPUT);
+  pinMode(waterLevelPin, INPUT);
+
+  sensors[0].value = readPhProbe();
+  sensors[1].value = readTemperatureProbe();
+  sensors[2].value = readEcProbe();
+  sensors[3].value = readWaterLevelProbe();
 }
 
 void loop() {
-  currentPh = calculatePh(readAndPrint(phPin, false));
   communicate();
-  closeLoop(expectedPh, currentPh, 0.1f);
-  delay(10);
+  uint32_t now = millis();
+  for (SensorState& sensor : sensors) {
+    updateSensor(sensor, now);
+  }
+  yield();
 }
 
-bool parseFloatValue(String text, float& value) {
-  text.trim();
-  if (text.isEmpty()) {
+bool parseFloatValue(const char* text, float& value) {
+  char* end = nullptr;
+  float parsedValue = strtof(text, &end);
+  if (end == text) {
     return false;
   }
 
-  const char* start = text.c_str();
-  char* end = nullptr;
-  float parsedValue = strtof(start, &end);
-  if (end == start || *end != '\0' || !isfinite(parsedValue)) {
+  while (*end == ' ' || *end == '\t') {
+    ++end;
+  }
+  if (*end != '\0' || !isfinite(parsedValue)) {
     return false;
   }
 
@@ -57,105 +114,179 @@ bool parseFloatValue(String text, float& value) {
 }
 
 void communicate() {
-  if (!SerialBT.available()) {
-    return;
-  }
+  while (SerialBT.available()) {
+    char character = static_cast<char>(SerialBT.read());
+    if (character == '\r') {
+      continue;
+    }
 
-  String commandLine = SerialBT.readStringUntil('\n');
-  commandLine.trim();
-  if (commandLine.isEmpty()) {
-    return;
-  }
-
-  int separator = commandLine.indexOf(':');
-  if (separator < 0) separator = commandLine.indexOf(',');
-  if (separator < 0) separator = commandLine.indexOf(' ');
-
-  String commandText = separator < 0 ? commandLine : commandLine.substring(0, separator);
-  int command = commandText.toInt();
-  float requestedValue = 0.0f;
-  bool hasValue = separator >= 0 && parseFloatValue(commandLine.substring(separator + 1), requestedValue);
-
-  switch (command) {
-    case 200:
-      SerialBT.println(currentPh, 2);
-      break;
-    case 201:
-    case 202:
-    case 203:
-      SerialBT.println("NOT_IMPLEMENTED");
-      break;
-    case 101:
-    case 102:
-    case 103:
-    case 104:
-      if (!hasValue || (command == 101 && (requestedValue < 0.0f || requestedValue > 14.0f))) {
-        SerialBT.println("Invalid target; use command:value (pH range 0-14)");
-        break;
+    if (character == '\n') {
+      if (!discardCommand && commandLength > 0) {
+        commandBuffer[commandLength] = '\0';
+        handleCommand(commandBuffer);
       }
-      updateWantedValue(command, requestedValue);
-      SerialBT.println("Target updated");
-      break;
-    default:
-      SerialBT.println("Unknown command");
-      break;
+      commandLength = 0;
+      discardCommand = false;
+      continue;
+    }
+
+    if (discardCommand) {
+      continue;
+    }
+    if (commandLength < sizeof(commandBuffer) - 1) {
+      commandBuffer[commandLength++] = character;
+    } else {
+      commandLength = 0;
+      discardCommand = true;
+      SerialBT.println("Command too long");
+    }
   }
 }
 
-int readAndPrint(int pin, bool printValue) {
-  int value = analogRead(pin);
-  if (printValue) {
-    Serial.print("Pin ");
-    Serial.print(pin);
-    Serial.print(": ");
-    Serial.print(value);
-    Serial.print(" | ");
+void handleCommand(char* commandLine) {
+  while (*commandLine == ' ' || *commandLine == '\t') {
+    ++commandLine;
   }
-  return value;
-}
-
-float calculatePh(int raw) {
-  return (float)raw * (14.0 / 4095.0);
-}
-
-void updateWantedValue(int command, float value) {
-  switch (command) {
-    case 101:
-      expectedPh = value;
-      break;
-    case 102:
-      expectedTemp = value;
-      break;
-    case 103:
-      expectedEc = value;
-      break;
-    case 104:
-      expectedWaterLevel = value;
-      break;
+  char* separator = strpbrk(commandLine, ":, \t ");
+  char* valueText = nullptr;
+  if (separator != nullptr) {
+    *separator = '\0';
+    valueText = separator + 1;
   }
-}
 
-void closeLoop(float expected, float actual, float tolerance) {
-  static int previousStatus = 2;
-  float difference = expected - actual;
-  int status = fabsf(difference) <= tolerance ? 0 : (difference > 0.0f ? 1 : -1);
-
-  if (status == previousStatus) {
+  char* commandEnd = nullptr;
+  long command = strtol(commandLine, &commandEnd, 10);
+  if (commandEnd == commandLine || *commandEnd != '\0') {
+    SerialBT.println("Unknown command");
     return;
   }
 
-  if (status > 0) {
-    Serial.println("pH low: increase");
-    SerialBT.println("pH low: increase");
-  } else if (status < 0) {
-    Serial.println("pH high: decrease");
-    SerialBT.println("pH high: decrease");
-  } else {
-    Serial.println("pH stable");
-    SerialBT.println("pH stable");
+  if (command >= 200 && command <= 203) {
+    printSensorValue(sensors[command - 200], SerialBT);
+    return;
   }
 
-  previousStatus = status;
+  if (command == 500) {
+    for (size_t index = 0; index < sizeof(sensors) / sizeof(sensors[0]); ++index) {
+      if (index > 0) SerialBT.print(" | ");
+      SerialBT.print(sensors[index].name);
+      SerialBT.print(": ");
+      printSensorValue(sensors[index], SerialBT);
+      SerialBT.print(" | target: ");
+      SerialBT.print(sensors[index].target, 2);
+    }
+    SerialBT.println();
+    return;
+  }
+
+  if (command >= 101 && command <= 104) {
+    size_t index = static_cast<size_t>(command - 101);
+    float requestedValue = 0.0f;
+    if (valueText == nullptr || !parseFloatValue(valueText, requestedValue) ||
+        requestedValue < sensors[index].minimumTarget ||
+        requestedValue > sensors[index].maximumTarget ||
+        (index == 3 && requestedValue != 0.0f && requestedValue != 1.0f)) {
+      SerialBT.println("Invalid target value");
+      return;
+    }
+
+    sensors[index].target = requestedValue;
+    SerialBT.println("Target updated");
+    evaluateControlStatus(sensors[index]);
+    return;
+  }
+
+  SerialBT.println("Unknown command");
 }
 
-// Queries: 200-203. Set targets with 101-104 followed by ':' and a value, e.g. 101:7.2.
+void updateSensor(SensorState& sensor, uint32_t now) {
+  if (sensor.hasRead && static_cast<uint32_t>(now - sensor.lastReadAt) < sensor.intervalMs) {
+    return;
+  }
+
+  sensor.hasRead = true;
+  sensor.lastReadAt = now;
+  float newValue = sensor.readProbe();
+  if (!isfinite(newValue)) {
+    sensor.value = NAN;
+    sensor.available = false;
+    sensor.previousStatus = 2;
+    if (!sensor.unavailableReported) {
+      Serial.print(sensor.name);
+      Serial.println(" reading unavailable; configure its probe reader");
+      sensor.unavailableReported = true;
+    }
+    return;
+  }
+
+  sensor.value = newValue;
+  sensor.available = true;
+  sensor.unavailableReported = false;
+
+  if (!sensor.hasPrintedValue || fabsf(newValue - sensor.lastPrintedValue) >= sensor.reportThreshold) {
+    Serial.print(sensor.name);
+    Serial.print(": ");
+    Serial.println(newValue, 2);
+    sensor.lastPrintedValue = newValue;
+    sensor.hasPrintedValue = true;
+  }
+
+  evaluateControlStatus(sensor);
+}
+
+void evaluateControlStatus(SensorState& sensor) {
+  if (!sensor.available) {
+    return;
+  }
+
+  float difference = sensor.target - sensor.value;
+  int status = fabsf(difference) <= sensor.tolerance ? 0 : (difference > 0.0f ? 1 : -1);
+  if (status == sensor.previousStatus) {
+    return;
+  }
+
+  Serial.print(sensor.name);
+  if (status > 0) {
+    Serial.println(" is below target");
+  } else if (status < 0) {
+    Serial.println(" is above target");
+  } else {
+    Serial.println(" is within target tolerance");
+  }
+  sensor.previousStatus = status;
+}
+
+void printSensorValue(const SensorState& sensor, Print& output) {
+  if (!sensor.available) {
+    output.print("NOT_READY");
+    return;
+  }
+  output.print(sensor.value, 2);
+}
+
+float readPhProbe() {
+  float rawValue = analogRead(phPin);
+  float pHValue = map(rawValue, 0, 4095, 0, 14);
+  return pHValue;
+}
+
+float readTemperatureProbe() {
+  float rawTemperature = analogRead(tempPin);
+  float voltage = (rawTemperature / 4095.0) * 3.3; // raw t0o voltage
+  float temperatureCelsius = (voltage - 0.5) * 100.0;
+  return temperatureCelsius;
+}
+
+float readEcProbe() {
+  float rawEcValue = analogRead(ecPin);
+  // TODO: Convert
+  return NAN;
+}
+
+float readWaterLevelProbe() {
+  bool waterLevelReached = digitalRead(waterLevelPin) == HIGH;
+  //1.0 when the level switch is reached, otherwise 0.0.
+  return waterLevelReached ? 1.0f : 0.0f;
+}
+
+// Queries: 200-203, 500 (all). Set targets with 101-104:value, e.g. 101:7.2.
