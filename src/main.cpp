@@ -1,6 +1,8 @@
 #include <Arduino.h>
 #include <WiFi.h>
 
+static const char* ssid = "botanicalEsp";
+static const char* password = "1234";
 
 WiFiServer wifiServer(5000);
 
